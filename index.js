@@ -19,6 +19,7 @@ import moment from 'moment-timezone';
 import axios from 'axios';
 import config from './config.cjs';
 import pkg from './lib/autoreact.cjs';
+import MegaSessionManager from './lib/mega-session-manager.js';
 const { emojis, doReact } = pkg;
 
 const sessionName = "session";
@@ -48,20 +49,75 @@ if (!fs.existsSync(sessionDir)) {
 }
 
 async function downloadSessionData() {
-    if (!config.SESSION_ID) {
-        console.error('Please add your session to SESSION_ID env !!');
+    // Try MEGA.nz first if credentials are available
+    if (config.MEGA_EMAIL && config.MEGA_PASSWORD) {
+        try {
+            const megaManager = new MegaSessionManager(
+                config.MEGA_EMAIL,
+                config.MEGA_PASSWORD,
+                config.MEGA_SESSION_FILE
+            );
+            
+            const success = await megaManager.downloadSession(credsPath);
+            await megaManager.close();
+            
+            if (success) {
+                console.log("🔒 Session Successfully Loaded from MEGA.nz !!");
+                return true;
+            }
+        } catch (error) {
+            console.error('❌ Failed to download session from MEGA.nz:', error.message);
+        }
+    }
+    
+    // Fallback to Pastebin for backward compatibility
+    if (config.SESSION_ID) {
+        console.log('🔄 Falling back to Pastebin session download...');
+        try {
+            const sessdata = config.SESSION_ID.split("Ethix-MD&")[1];
+            const url = `https://pastebin.com/raw/${sessdata}`;
+            const response = await axios.get(url);
+            const data = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+            await fs.promises.writeFile(credsPath, data);
+            console.log("🔒 Session Successfully Loaded from Pastebin !!");
+            return true;
+        } catch (error) {
+            console.error('❌ Failed to download session from Pastebin:', error.message);
+        }
+    }
+    
+    if (!config.MEGA_EMAIL && !config.SESSION_ID) {
+        console.error('❌ Please add either MEGA.nz credentials (MEGA_EMAIL & MEGA_PASSWORD) or SESSION_ID env variables !!');
+    }
+    
+    return false;
+}
+
+async function uploadSessionData() {
+    if (!config.MEGA_EMAIL || !config.MEGA_PASSWORD) {
+        console.log('📝 MEGA.nz credentials not available, skipping session upload');
         return false;
     }
-    const sessdata = config.SESSION_ID.split("Ethix-MD&")[1];
-    const url = `https://pastebin.com/raw/${sessdata}`;
+
+    if (!fs.existsSync(credsPath)) {
+        console.log('📝 No local session file to upload');
+        return false;
+    }
+
     try {
-        const response = await axios.get(url);
-        const data = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-        await fs.promises.writeFile(credsPath, data);
-        console.log("🔒 Session Successfully Loaded !!");
+        const megaManager = new MegaSessionManager(
+            config.MEGA_EMAIL,
+            config.MEGA_PASSWORD,
+            config.MEGA_SESSION_FILE
+        );
+        
+        await megaManager.uploadSession(credsPath);
+        await megaManager.close();
+        
+        console.log("☁️ Session Successfully Uploaded to MEGA.nz !!");
         return true;
     } catch (error) {
-       // console.error('Failed to download session data:', error);
+        console.error('❌ Failed to upload session to MEGA.nz:', error.message);
         return false;
     }
 }
@@ -104,7 +160,18 @@ async function start() {
             }
         });
 
-        Matrix.ev.on('creds.update', saveCreds);
+        Matrix.ev.on('creds.update', async () => {
+            await saveCreds();
+            // Upload updated credentials to MEGA.nz if configured
+            if (config.MEGA_EMAIL && config.MEGA_PASSWORD) {
+                try {
+                    console.log('🔄 Uploading updated session to MEGA.nz...');
+                    await uploadSessionData();
+                } catch (error) {
+                    console.error('❌ Failed to upload session after credentials update:', error.message);
+                }
+            }
+        });
 
         Matrix.ev.on("messages.upsert", async chatUpdate => await Handler(chatUpdate, Matrix, logger));
         Matrix.ev.on("call", async (json) => await Callupdate(json, Matrix));
